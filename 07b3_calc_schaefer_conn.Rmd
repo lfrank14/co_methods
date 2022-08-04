@@ -1,0 +1,118 @@
+---
+title: "Calculate Connectivity for Background Conn Methods Comparison"
+author: "Lea"
+date: "12/12/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(psych)
+```
+
+#### Set Parameters
+
+```{r}
+## Scanning runs
+expo_runs <- c("expo_run-1","expo_run-2","expo_run-3","expo_run-4")
+expo_runs_lpf <- str_c(expo_runs, "_lpf")
+expo_runs_resid <- str_c(expo_runs, "_resid")
+runs <- c("rest",expo_runs_lpf, expo_runs_resid)
+nruns <- length(runs)
+
+## ROIs
+schaefrois <- scan(file = "Schaefer_parcels/schaefer_100parcels_7networks_lut.txt", what = character())
+schaefrois_ordered <- scan(file = "Schaefer_parcels/schaefer_100parcels_7networks_labels.txt", what = character())
+nschaefrois <- length(schaefrois)
+
+## Subject IDs
+# excluding sub-3 for shorter rest period
+sbjs <- c(1:3,7:8,11:26,28:39,41:52,54:58,60:70)
+nsub <- length(sbjs)
+
+## Directories
+expdir <- "/gpfs/projects/bamlab/shared/aepet2"
+conndir <- str_c(expdir,"/connectivity")
+indir <- str_c(conndir,"/ts_schaefer")
+scrubdir <- str_c(conndir,"/scrubmasks")
+nuisdir <- str_c(conndir,"/nuisance")
+```
+
+#### Calculate connectivity
+
+```{r}
+conn_grid <- expand.grid(sbjs = sbjs,
+                         runs = runs)
+
+conn <- conn_grid %>% 
+  mutate(data = map2(conn_grid$sbjs, conn_grid$runs, ~{
+    
+    # # troubleshoot
+    # .x <- sbjs[8]
+    # .y <- runs[2]
+    
+    if (.y == "rest") {
+      r <- "rest"
+    } else {
+      r <- str_remove(.y, "_lpf|_resid")
+    }
+    
+    # list files for subject and timecond
+    fnames <- list.files(indir, pattern = str_c("ts_", .x, "_", .y))
+    
+    # add root path to get file paths for loading
+    fpaths <- str_c(indir, "/", fnames)
+    
+    # create list of rois 
+    rois <- str_remove(fnames, str_c("ts_", .x, "_", .y, "_"))
+    rois <- str_remove(rois, ".txt")
+    
+    # load the timeseries into single dataframe
+    ts <- map_dfc(fpaths, rio::import) %>% 
+      setNames(rois) %>% 
+      suppressMessages()
+    
+    # count number of volumes
+    nvol <- nrow(ts)
+    
+    # load the scrubbing mask
+    npath <- str_c(scrubdir, "/ts_", .x, "_", r, "_scrub.txt")
+    isok <- rio::import(npath)
+
+    # load the nuisance regressors
+    if (str_detect(.y, "lpf")) {
+      npath2 <- str_c(nuisdir,"/ts_", .x, "_", r, "_lpf_nuisance.txt")
+    } else {
+      npath2 <- str_c(nuisdir,"/ts_", .x, "_", r, "_reg_nuisance.txt")
+    }
+    nuisance <- rio::import(npath2)
+    
+    # apply scrubbing mask to nuisance regressors
+    nuisance <- nuisance %>% 
+      filter(isok==1)
+    
+    # apply scrubbing mask to timeseries
+    ts <- ts %>% 
+      filter(isok==1) %>%
+      # arrange columns by networks
+      select(schaefrois_ordered)
+      
+    # add nuisance regressors to timeseries
+    ts <- cbind(ts, nuisance)
+
+    # partial correlation controlling for nuisance regressors
+    ## have to remove attribute of 'psych' object
+    connmat <- partial.r(ts,
+                       c(1:nschaefrois),
+                       c((nschaefrois+1):ncol(ts)))
+    attr(connmat, "class") <- NULL
+    connmatz <- fisherz(connmat)
+      
+    return(list(connmat, connmatz))
+  }))
+
+# save connectivity matrices
+saveRDS(conn, str_c(conndir,"/schaefconn.rds"))
+```

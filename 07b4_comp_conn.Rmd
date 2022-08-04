@@ -1,0 +1,1890 @@
+---
+title: "Compare Background Connectivity Methods"
+author: "Lea Frank"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_folding: hide
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+## Initialize
+
+Load packages
+
+```{r, include=FALSE}
+library(tidyverse)
+library(reshape2)
+library(magrittr)
+library(ggcorrplot)
+library(afex)
+library(emmeans)
+library(ggExtra)
+library(ggokabeito)
+library(psych)
+library(ggridges)
+```
+
+Set figure theme
+
+```{r}
+theme_set(theme_minimal())
+```
+
+Define parameters
+
+```{r}
+method <- c("rest","lpf","resid")
+```
+
+Create Schaefer labels
+
+```{r}
+rois <- read.delim("schaefer_100parcels_7networks_labels.txt",
+                   header = FALSE)
+colnames(rois) <- "roi"
+
+# add column for network
+rois <- rois %>% 
+  mutate(tmp = roi) %>% 
+  separate(tmp, c(NA,"net",NA,NA), sep = "_") %>% 
+  suppressWarnings()
+```
+
+## Load Data
+
+Load behavioral data from facat
+
+```{r}
+behav <- read_csv("../data/aepet2_sem.csv") %>% 
+  select(ssid, facat_acc_cat_old, facat_acc_cat_new, facat_acc_recog_chr)
+```
+
+
+Load aepet2 data
+
+```{r}
+aepet2 <- readRDS("../data/schaefconn.rds") %>% 
+  unnest_wider(data) %>% 
+  rename(conn = ...1,
+         connz = ...2) %>% 
+  suppressMessages()
+
+```
+
+
+Load motion data 
+
+```{r}
+qa <- read_csv("../data/qa_reg.csv")
+```
+
+
+Exclusions
+
+```{r}
+## Complete exclusions
+## participants excluded for missing rest OR 3+ runs of exposure
+# sub-21: too much data scrubbed
+# sub-25: rest, fell asleep
+# sub-49: all runs, fell asleep during pre-exposure and was giving responses during post-exposure
+# sub-60: all runs, looked like sleeping during rest and pre-exposure
+# sub-61: all runs, looked like sleeping during entire scan
+# sub-62: all runs, non-compliant, fell asleep, and too much motion
+aepet2 <- aepet2 %>%
+  filter( !(sbjs %in% c(21,25,49,60,61)) )
+
+length(unique(aepet2$sbjs))
+
+## Partial exclusions
+## participants missing no more than 2 exposure runs
+# sub-34: expo4, task didn't run
+aepet2$conn[aepet2$sbjs==34 & str_detect(aepet2$runs, "expo_run-4")] <- NA
+aepet2$connz[aepet2$sbjs==34 & str_detect(aepet2$runs, "expo_run-4")] <- NA
+
+# sub-56: expo3-4, gave responses during post-exposure task
+aepet2$conn[aepet2$sbjs==56 & str_detect(aepet2$runs, "expo_run-4|expo_run-3")] <- NA
+aepet2$connz[aepet2$sbjs==56 & str_detect(aepet2$runs, "expo_run-4|expo_run-3")] <- NA
+
+# sub-63: expo3-4, fell asleep during post-exposure
+aepet2$conn[aepet2$sbjs==63 & str_detect(aepet2$runs, "expo_run-4|expo_run-3")] <- NA
+aepet2$connz[aepet2$sbjs==63 & str_detect(aepet2$runs, "expo_run-4|expo_run-3")] <- NA
+
+```
+
+Separate and average across runs
+
+```{r}
+# rest connectivity
+rest <- aepet2 %>% 
+  filter(runs == "rest") %>% 
+  rename(method = runs)
+
+# low-pass filter connectivity
+lpf <- aepet2 %>% 
+  filter(str_detect(runs, "lpf")) %>% 
+  group_by(sbjs) %>% 
+  summarize(conn = list(rowMeans(simplify2array(conn[!is.na(conn)]), dims = 2)),
+            connz = list(rowMeans(simplify2array(connz[!is.na(connz)]), dims = 2)),
+            .groups = "keep") %>% 
+  mutate(method = "lpf")
+
+# residual connectivity
+resid <- aepet2 %>% 
+  filter(str_detect(runs, "resid")) %>% 
+  group_by(sbjs) %>% 
+  summarize(conn = list(rowMeans(simplify2array(conn[!is.na(conn)]), dims = 2)),
+            connz = list(rowMeans(simplify2array(connz[!is.na(connz)]), dims = 2)),
+            .groups = "keep") %>% 
+  mutate(method = "resid")
+
+## merge them into single df
+# also remove the factor groups of the method column
+df <- rbind(rest, lpf, resid) %>% 
+  mutate(method = factor(method))
+
+# # can probably clear these out
+# rm(rest, lpf, resid)
+```
+
+Melt the z matrices for analysis
++ add column for network
++ add column for hemisphere
++ add column for within or between network connection
+
+```{r}
+# get the lower matrix only
+df_lower <- df %>% 
+  mutate(conn = map(conn, ~{
+    tmp <- .x
+    tmp[upper.tri(tmp, diag = TRUE)] <- NA
+    return(tmp)
+  }),
+  connz = map(connz, ~{
+    tmp <- .x
+    tmp[upper.tri(tmp, diag = TRUE)] <- NA
+    return(tmp)
+  }))
+
+# melt correlation matrices
+# too large so had to keep separate
+df_meltz <- df_lower %>% 
+  select(-conn) %>%  
+  group_by(sbjs, method) %>% 
+  mutate(connz = list(melt(connz,
+                           varnames = c("roi1","roi2"),
+                           value.name = "connz",
+                           na.rm = TRUE))) %>% 
+  unnest(connz) %>% 
+  select(-contains("L1")) %>% 
+  suppressMessages()
+
+df_melt <- df_lower %>% 
+  select(-connz) %>%  
+  group_by(sbjs, method) %>% 
+  mutate(conn = list(melt(conn,
+                           varnames = c("roi1","roi2"),
+                           value.name = "conn",
+                           na.rm = TRUE))) %>% 
+  unnest(conn) %>% 
+  select(-contains("L1")) %>% 
+  suppressMessages()
+
+# create column identifying the network for each ROI
+## joining seems weird, but computationally much easier than dealing with 80k+ warnings
+# then, create column identifying within/between-network connections
+df_meltz <- left_join(df_meltz, rois, by = c("roi1" = "roi")) %>% 
+  rename(net1 = net) %>% 
+  left_join(rois, by = c("roi2" = "roi")) %>% 
+  rename(net2 = net) %>% 
+  mutate(nettype = ifelse(net1 == net2, "within", "between"))
+
+df_melt <- left_join(df_melt, rois, by = c("roi1" = "roi")) %>% 
+  rename(net1 = net) %>% 
+  left_join(rois, by = c("roi2" = "roi")) %>% 
+  rename(net2 = net) %>% 
+  mutate(nettype = ifelse(net1 == net2, "within", "between"))
+```
+
+
+## Analysis 1
+
+#### How consistent are individual connectivity patterns between the three methods?
+
+We will first look at how similar within-subject patterns of connectivity are between the three methods (rest, low pass filter, and FIR residual connectivity).
+
+*Figure 2.* 3 group-averaged raw connectivity matrices (rest, lpf, residual) with the ROIs organized by the 7 cortical networks
+
+```{r}
+dfAvg <- df %>% 
+  group_by(method) %>% 
+  summarize(conn = list(rowMeans(simplify2array(conn), dims = 2)),
+         .groups = "keep")
+
+tmp <- dfAvg %>% 
+  filter(method == "rest")
+tmp <- tmp$conn[[1]]
+
+netcolors <- c(rep("#E69F00", 17),
+               rep("#56B4E9", 14), 
+               rep("#009E73", 15),
+               rep("#F0E442", 12),
+               rep("#0072B2", 5),
+               rep("#D55E00", 13),
+               rep("#CC79A7",24))
+
+walk(method, ~{
+  fig_groupavg <- dfAvg %>% 
+    filter(method == .x) %$%
+    ggcorrplot(conn[[1]], method = "square", outline.color = FALSE,
+               lab = FALSE, tl.col = netcolors, tl.cex = 5, title = .x,
+               legend.title = "Conn (r)")
+  
+    # STARTED ADDING COLORS TO LABELS FINISH LATER  
+    # corrplot::corrplot(tmp, method = "color",
+    #                    type = "full", bg = "white",
+    #                    tl.srt = 45, tl.col = netcolors,
+    #                    outline = FALSE)
+  
+  fname <- str_c("figures/", .x, "_groupAvg.pdf")
+  # ggsave(fname,
+  #        fig_groupavg,
+  #        width = 8, height = 8)
+})
+
+```
+
+For each subject, spearman correlations will be conducted between the Fisher z transformed connectivity estimates for each method (i.e., rest-lpf, rest-resid, lpf-resid). The spearman correlation coefficients will then be Fisher z transformed for analysis. 
+
+```{r}
+corrMethods <- df_meltz %>% 
+  pivot_wider(names_from = method,
+              values_from = connz) %>% 
+  group_by(sbjs) %>%
+  summarize(rest_lpf = cor(rest, lpf, method = "spearman"),
+            rest_resid = cor(rest, resid, method = "spearman"),
+            lpf_resid = cor(lpf, resid, method = "spearman"),
+            .groups = "keep") %>% 
+  mutate(rest_lpfz = psych::fisherz(rest_lpf),
+         rest_residz = psych::fisherz(rest_resid),
+         lpf_residz = psych::fisherz(lpf_resid))
+```
+
+A paired-samples t-test will be conducted to compare which method produces connectivity estimates more similar to resting state connectivity (rest-lpf correlations v. rest-resid correlations). 
+
+```{r}
+lpf_v_resid <- t.test(corrMethods$rest_lpfz, corrMethods$rest_residz,
+                      paired = TRUE) %>% 
+  broom::tidy()
+
+cohensd <- corrMethods %>% 
+  select(sbjs, rest_lpfz, rest_residz) %>% 
+  pivot_longer(cols = c(2:3),
+               names_to = "comparison", 
+               values_to = "rz") %$% 
+  lsr::cohensD(rz ~ comparison,
+             method = "paired")
+
+(lpf_v_rest <- lpf_v_resid %>% 
+    mutate(cohensd = cohensd))
+```
+
+```{r}
+# modify df for plotting
+# calculate mean and sd for each comparison
+corrMethods_mod <- corrMethods %>% 
+  select(sbjs, !contains("z")) %>% 
+  pivot_longer(cols = 2:4,
+               names_to = "comparison",
+               values_to = "r") %>% 
+  group_by(comparison) %>% 
+  mutate(mean = mean(r),
+         se = lurr::se(r)) %>% 
+  ungroup() %>% 
+  mutate(comparison = fct_relevel(comparison,
+                                  "rest_lpf", "rest_resid"))
+```
+
+*Figure 3.* Boxplot showing the distribution of spearman correlations in the pattern of connectivity between the methods (i.e., rest-lpf, rest-resid, lpf-resid).
+
+```{r}
+colorlabs <- c("#1b9e77","#d95f02","#666666")
+
+(fig_corrMethods_bp <- corrMethods_mod %>% 
+  ggplot(aes(x = comparison, y = r, color = comparison)) + 
+  geom_boxplot(size = 1.1) +
+  geom_dotplot(aes(fill = comparison),
+               binaxis = "y", stackdir = "center",
+               alpha = .4, dotsize = .75) +
+  #scale_color_brewer(type = "qual", palette = "Dark2") +
+  #scale_fill_brewer(type = "qual", palette = "Dark2") +
+  scale_fill_manual(values = colorlabs) +
+  scale_color_manual(values = colorlabs) +
+  theme(legend.position = "none",
+        text = element_text(size = 30),
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10))) + 
+  labs(x = "Comparison",
+       y = "Similarity (rho)") +
+  scale_x_discrete(labels = c("RestxLPF","RestxFIR","LPFxFIR")) +
+  ylim(c(.3,1)))
+
+# ggsave("figures/corr_methods_boxplot.pdf",
+#        fig_corrMethods_bp, dpi = 300,
+#        width = 7, height = 6, units = "in")
+```
+
+Or the figure that Dasa suggested..
+
+```{r}
+# (fig_corrMethods2 <- corrMethods_mod %>% 
+#   ungroup() %>% 
+#   filter(comparison != "lpf_resid") %>% 
+#   ggplot(aes(x = comparison)) +
+#   geom_bar(aes(y = mean, color = comparison), stat = "summary", size = 1.01,
+#            fun = "mean", fill = "white") +
+#   geom_line(aes(y = r, group = sbjs),
+#             alpha = .5) + 
+#   geom_point(aes(y = r, color = comparison), stat = "identity",
+#              alpha = .5, size = 3) +
+#   scale_color_brewer(type = "qual", palette = "Dark2") +
+#   theme(legend.position = "none",
+#         text = element_text(size = 30),
+#         axis.text = element_text(color = "black"),
+#         axis.title.x = element_text(margin = margin(t = 10)),
+#         axis.title.y = element_text(margin = margin(r = 10))) +
+#   labs(x = "Comparison", y = "Spearman's rho") +
+#   scale_x_discrete(labels = c("RestxLPF","RestxFIR")) +
+#   ylim(c(0,1)) )
+
+# ggsave("figures/corr_methods_lines_wide.pdf",
+#        fig_corrMethods2, dpi = 300,
+#        width = 7, height = 6, units = "in")
+```
+
+Run correlation and plot scatterplot to show correlation between LPF x Rest similarity and Resid x Rest similarity. 
+
+```{r}
+cor.test(corrMethods$rest_lpfz, corrMethods$rest_residz)
+
+fig_corrComps <- corrMethods %>% 
+  ggplot(aes(x = rest_lpf, y = rest_resid)) +
+  geom_point(stat = "identity", alpha = .5) +
+  # geom_smooth(method = "lm", color = "black") +
+  theme(text = element_text(size = 30),
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10))) +
+  xlim(c(.3,1)) +
+  ylim(c(.3,1)) +
+  labs(x = "Rest x LPF Similarity (rho)",
+       y = "Rest x FIR Similarity (rho)") + 
+  geom_abline(slope = 1, linetype = "dashed")
+
+(fig_corrComps <- ggMarginal(fig_corrComps, data = corrMethods_mod, type = "density", 
+                             xparams = list(fill = "#1B9E77", alpha = .75),
+                             yparams = list(fill = "#D95F02", alpha = .75)))
+# 
+# ggsave("figures/corr_methods_scatter.pdf",
+#        fig_corrComps, dpi = 300,
+#        width = 7, height = 6)
+```
+
+Is inconsistency between rest and background connectivity driven by motion?
+
+```{r}
+qa_corrMethods <- left_join(corrMethods, qa, by = c("sbjs" = "ssid")) %>% 
+  left_join(behav, by = c("sbjs" = "ssid")) %>% 
+  select(-rest_lpf, -rest_resid, -lpf_resid, -contains("csf"),
+         -contains("wm"), -contains("wholebrain")) %>% 
+  mutate(expo_propkept = (reg_expo1_propkept_isok2 + reg_expo2_propkept_isok2+ reg_expo3_propkept_isok2 + reg_expo1_propkept_isok2)/4)
+
+cor(qa_corrMethods, use = "pairwise.complete.obs")
+
+```
+
+
+
+To quantify the similarity to rest connectivity, we will report the median correlation and the range of correlations. The median/range of correlations between low-pass filter connectivity and FIR residual connectivity will also be reported to evaluate how similar the estimates are between the two methods.
+
+```{r}
+(corrMethods_sum <- corrMethods %>% 
+  ungroup() %>% 
+  select(-sbjs) %>% 
+  psych::describe())
+
+```
+
+## Analysis 2
+
+#### How well do each of the background connectivity methods reproduce the 7 cortical networks defined by Yeo et al. (2011)?
+
+For each participant, we will calculate the within-network and between-network connectivity produced by each method. The mean within-network connectivity will be an average of all within-network connections, while the between-network connectivity will be an average of all between-network connections. 
+ 
+**QUESTION** when averaging the within-network connectivity, we want to exclude connections with themselves right? - YES. And they already do. When I take the  connections from the lower half of the matrix (before I melt them), I exclude the diagonals (i.e., I exclude connections between an roi and itself).
+
+```{r}
+# get mean connectivity for each network-network connection
+# identify within- and between-network connections
+connNetAll <- df_meltz %>% 
+  unite(col = "netconn",
+        c(net1, net2), 
+        sep = "_") %>% 
+  group_by(sbjs, method, netconn, nettype) %>% 
+  summarize(mconnz = mean(connz),
+            .groups = "keep")
+
+connNetAll_sum <- connNetAll %>% 
+  group_by(method, netconn, nettype) %>% 
+  summarize(mean = mean(mconnz),
+            se = lurr::se(mconnz),
+            .groups = "keep")
+
+# get mean within-network and between-network connectivity
+# exclude diagonal connections
+connNet <- df_meltz %>% 
+  group_by(sbjs, method, nettype) %>% 
+  summarize(mconnz = mean(connz),
+            .groups = "keep")
+```
+
+
+**Figure 4** 3 (rest, lpf, resid) 7x7 matrices showing the group-averaged within- and between-network connectivity for the raw estimates. Basically Figure 2 but now averaged down to show just the networks. 
+
+```{r}
+# group averaging network-network connectivity for each method
+connNetAll_avg <- df_melt %>% 
+  unite(col = "netconn",
+        c(net1, net2), 
+        sep = "_") %>% 
+  group_by(method, netconn, nettype) %>% 
+  summarize(mconn = mean(conn),
+            .groups = "keep") %>% 
+  separate(netconn, c("net1","net2")) %>% 
+  ungroup()
+
+network_order <- c("default","cont","limbic","salventattn",
+                   "dorsattn","sommot","vis")
+
+figs_connNetAll_avg <- map_dfr(method, ~{
+  # # troubleshoot
+  # .x <- "rest"
+  
+  # filter out connections for method
+  tmp <- connNetAll_avg %>% 
+    filter(method==.x)
+  
+  # add in the upper triangle connections
+  tmp_sub <- tmp %>% 
+    filter(nettype == "between") %>% 
+    rename(net1 = net2,
+           net2 = net1)
+  
+  # bind into single df
+  tmp <- rbind(tmp, tmp_sub) %>% 
+    select(net1, net2, mconn) %>% 
+    mutate(net1 = fct_relevel(net1,
+                              rev(network_order)),
+           net2 = fct_relevel(net2,
+                              rev(network_order))) %>% 
+    arrange(net1)
+  
+  # cast into matrix for plotting
+  tmpMat <- acast(data = tmp,
+                  net1~net2,
+                  value.var = "mconn")
+  
+  # plot 
+  tmpFig <- ggcorrplot(tmpMat,
+                       method = "square",
+                       outline.color = "white",
+                       lab = TRUE,
+                       legend.title = "Mean Conn (r)",
+                       title = .x) # width 7, height 6
+
+  # ggsave(str_c("figures/connNetAll_",.x,".pdf"),
+  #        tmpFig, dpi = 300,
+  #        width = 7, height = 6, units = "in")
+
+  # return tibble with matrices and figures
+  return(tibble(method = .x,
+                corrmat = list(tmpMat),
+                figure = list(tmpFig)))
+})
+
+```
+
+**Figure 4B. OPTION 1**  7x7 matrices showing the group-averaged differences in within- and between-network connectivity between each method (rest-lpf, rest-resid, lpf - resid).
+
+```{r}
+# # calculating the differences in network-network connectivity between methods
+# # averaging those differences across subjects
+# connNetAll_avgDiffs <- connNetAll %>% 
+#   ungroup() %>% 
+#   pivot_wider(names_from = method,
+#               values_from = mconnz) %>% 
+#   mutate(lpf_rest = lpf - rest,
+#          resid_rest = resid - rest,
+#          lpf_resid = lpf - resid) %>% 
+#   select(-rest, -lpf, -resid) %>% 
+#   pivot_longer(cols = 4:6,
+#                names_to = "comparison",
+#                values_to = "mconnz") %>% 
+#   group_by(comparison, netconn, nettype) %>% 
+#   summarize(mconnz = mean(mconnz),
+#             .groups = "keep") %>% 
+#   separate(netconn, c("net1","net2")) %>% 
+#   ungroup()
+# 
+# comparison <- c("lpf_rest","resid_rest","lpf_resid")
+# 
+# # plot correlation matrices
+# figs_connNetAll_avgDiffs <- map_dfr(comparison, ~{
+#   # # troubleshoot
+#   # .x <- "lpf_rest"
+#   
+#   # filter out connections for method
+#   tmp <- connNetAll_avgDiffs %>% 
+#     filter(comparison==.x)
+#   
+#   # add in the upper triangle connections
+#   tmp_sub <- tmp %>% 
+#     filter(nettype == "between") %>% 
+#     rename(net1 = net2,
+#            net2 = net1)
+#   
+#   # bind into single df
+#   tmp <- rbind(tmp, tmp_sub) %>% 
+#     select(net1, net2, mconnz) %>% 
+#     mutate(net1 = fct_relevel(net1,
+#                               rev(network_order)),
+#            net2 = fct_relevel(net2,
+#                               rev(network_order))) %>% 
+#     arrange(net1)
+#   
+#   # cast into matrix for plotting
+#   tmpMat <- acast(data = tmp,
+#                   net1~net2,
+#                   value.var = "mconnz")
+#   
+#   # plot 
+#   tmpFig <- ggcorrplot(tmpMat,
+#                        method = "square",
+#                        outline.color = "white",
+#                        lab = TRUE,
+#                        title = .x) # width 7, height 6
+#   
+#   # ggsave(str_c("figures/connNetAll_",.x,".pdf"),
+#   #        tmpFig, dpi = 300,
+#   #        width = 7, height = 6, units = "in")
+#   
+#   # return tibble with matrices and figures
+#   return(tibble(method = .x,
+#                 corrmat = list(tmpMat),
+#                 figure = list(tmpFig)))
+# })
+
+```
+
+**Figure 4B. OPTION 2** 2 7x7 matrices showing the p-values of the differences in within- and between-network connectivity between rest-lpf and rest-resid.
+
+```{r}
+# get p-values and effect sizes for comparisons between methods
+connNetAll_compMethods <- connNetAll %>% 
+  pivot_wider(names_from = method,
+              values_from = mconnz) %>% 
+  group_by(netconn, nettype) %>% 
+  summarize(p_lpf_rest = t.test(lpf, rest, paired = TRUE)$p.value,
+            p_resid_rest = t.test(resid, rest, paired = TRUE)$p.value,
+            p_lpf_resid = t.test(lpf, resid, paired = TRUE)$p.value,
+            d_lpf_rest = lsr::cohensD(lpf, rest, method = "paired"),
+            d_resid_rest = lsr::cohensD(resid, rest, method = "paired"),
+            d_lpf_resid = lsr::cohensD(lpf, resid, method = "paired"),
+            .groups = "keep") %>% 
+  pivot_longer(cols = c(-1:-2),
+             names_to = "comparison",
+             values_to = "val") %>% 
+  separate(comparison, c("type","comparison"),
+           extra = "merge") %>% 
+  pivot_wider(names_from = type,
+              values_from = val) %>% 
+  separate(netconn, c("net1","net2")) %>% 
+  ungroup()
+```
+
+```{r}
+# comparison <- c("lpf_rest","resid_rest","lpf_resid")
+# 
+# # plot matrices with p-values
+# figs_connNetAll_pDiffs <- map_dfr(comparison, ~{
+#   # # troubleshoot
+#   # .x <- "lpf_rest"
+#   
+#   # filter out connections for method
+#   tmp <- connNetAll_compMethods %>% 
+#     filter(comparison == .x)
+#     
+#   
+#   # add in the upper triangle connections
+#   tmp_sub <- tmp %>% 
+#     filter(nettype == "between") %>% 
+#     rename(net1 = net2,
+#            net2 = net1)
+#   
+#   # bind into single df
+#   tmp <- rbind(tmp, tmp_sub) %>% 
+#     select(net1, net2, p) %>% 
+#     mutate(net1 = fct_relevel(net1,
+#                               rev(network_order)),
+#            net2 = fct_relevel(net2,
+#                               rev(network_order))) %>% 
+#     arrange(net1)
+#   
+#   # cast into matrix for plotting
+#   tmpMat <- acast(data = tmp,
+#                   net1~net2,
+#                   value.var = "p")
+#   
+#   # plot 
+#   tmpFig <- ggcorrplot(tmpMat,
+#                        method = "square",
+#                        outline.color = "white",
+#                        lab = TRUE,
+#                        title = .x,
+#                        legend.title = "p value") # width 7, height 6
+#   
+#   ggsave(str_c("figures/connNetAll_p_",.x,".pdf"),
+#          tmpFig, dpi = 300,
+#          width = 7, height = 6, units = "in")
+#   
+#   # return tibble with matrices and figures
+#   return(tibble(method = .x,
+#                 corrmat = list(tmpMat),
+#                 figure = list(tmpFig)))
+# })
+```
+
+**Figure 4C. OPTION 3** 2 7x7 matrices showing the effect size (d) of the differences in within- and between-network connectivity between rest-lpf and rest-resid.
+
+```{r}
+comparison <- c("lpf_rest","resid_rest","lpf_resid")
+
+# plot matrices with p-values
+figs_connNetAll_dDiffs <- map_dfr(comparison, ~{
+  # # troubleshoot
+  # .x <- "lpf_rest"
+  
+  # filter out connections for method
+  tmp <- connNetAll_compMethods %>% 
+    filter(comparison == .x)
+    
+  
+  # add in the upper triangle connections
+  tmp_sub <- tmp %>% 
+    filter(nettype == "between") %>% 
+    rename(net1 = net2,
+           net2 = net1)
+  
+  # bind into single df
+  tmp <- rbind(tmp, tmp_sub) %>% 
+    select(net1, net2, d) %>% 
+    mutate(net1 = fct_relevel(net1,
+                              rev(network_order)),
+           net2 = fct_relevel(net2,
+                              rev(network_order))) %>% 
+    arrange(net1)
+  
+  # cast into matrix for plotting
+  tmpMat <- acast(data = tmp,
+                  net1~net2,
+                  value.var = "d")
+  
+  # plot 
+  tmpFig <- ggcorrplot(tmpMat,
+                       method = "square",
+                       outline.color = "white",
+                       lab = TRUE,
+                       title = .x) + # width 7, height 6
+    scale_fill_gradient(limit = c(0, 2.5),
+                        low = "white", high = "red",
+                        name = "Cohen's d")
+  
+  # ggsave(str_c("figures/connNetAll_d_",.x,".pdf"),
+  #        tmpFig, dpi = 300,
+  #        width = 7, height = 6, units = "in")
+  
+  # return tibble with matrices and figures
+  return(tibble(method = .x,
+                corrmat = list(tmpMat),
+                figure = list(tmpFig)))
+})
+```
+
+We will run a 3 (method: rest, lpf, resid) x 2 (within-network, between-network) repeated measures ANOVA comparing the Fisher z transformed connectivity estimates. 
+
+```{r}
+# Run Omnibus ANOVA
+(comp_connNet <- aov_ez(data = connNet,
+                        id = "sbjs",
+                        dv = "mconnz",
+                        within = c("method","nettype")))
+
+# Check tests for sphericity 
+summary(comp_connNet)
+
+# Estimated Marginal Means
+### main effect of nettype
+print("main effect of nettype")
+(nettype.emm <- emmeans(comp_connNet, "nettype"))
+connNet %>% group_by(nettype) %>% summarize(mean = round(mean(mconnz), digits = 4), sd = round(sd(mconnz), digits = 4))
+afex_plot(comp_connNet, x = "nettype", error = "within")
+
+### main effect of method
+(method.emm <- emmeans(comp_connNet, "method"))
+connNet %>% group_by(method) %>% summarize(mean = round(mean(mconnz), digits = 4), sd = round(sd(mconnz), digits = 4))
+afex_plot(comp_connNet, x = "method", error = "within")
+pairs(method.emm, adjust = "none")
+
+print("effect size for lpf v. fir")
+connNet %>% 
+  filter(method != "rest") %>% 
+  mutate(method = factor(method)) %$%
+  lsr::cohensD(mconnz ~ method,
+               method = "paired")
+
+print("effect size for lpf v. rest")
+connNet %>% 
+  filter(method != "resid") %>% 
+  mutate(method = factor(method)) %$%
+  lsr::cohensD(mconnz ~ method,
+               method = "paired")
+
+print("effect size for fir v. rest")
+connNet %>% 
+  filter(method != "lpf") %>% 
+  mutate(method = factor(method)) %$%
+  lsr::cohensD(mconnz ~ method,
+               method = "paired")
+
+### method x nettype interaction
+(method_nettype.emm <- emmeans(comp_connNet, c("method","nettype")))
+afex_plot(comp_connNet, 
+          x = "nettype", trace = "method", 
+          mapping = "color", error = "within")
+
+# Post-Hoc Tests for Method x nettype Interaction
+
+# # Comparing between network connectivity
+# (comp_connBtw <- aov_ez(filter(connNet, nettype=="between"),
+#                        id = "sbjs",
+#                        dv = "mconnz",
+#                        within = "method"))
+# (method_btw.emm <- emmeans(comp_connBtw, "method"))
+# pairs(method_btw.emm, adjust = "none")
+# 
+# # Comparing between within connectivity
+# (comp_connWtn <- aov_ez(filter(connNet, nettype=="within"),
+#                        id = "sbjs",
+#                        dv = "mconnz",
+#                        within = "method"))
+# (method_wtn.emm <- emmeans(comp_connWtn, "method"))
+# pairs(method_wtn.emm, adjust = "none")
+
+
+# Compare differences 
+connNet_diffs <- connNet %>% 
+  pivot_wider(names_from = nettype,
+              values_from = mconnz) %>% 
+  rowwise() %>% 
+  mutate(diff = within - between)
+
+comp_connDiffs <- aov_ez(data = connNet_diffs,
+                          id = "sbjs",
+                          dv = "diff",
+                          within = "method")
+(method_diffs.emm <- emmeans(comp_connDiffs, "method"))
+afex_plot(comp_connDiffs, x = "method", error = "within")
+pairs(method_diffs.emm, adjust = "none")
+
+print("Cohen's d for LPF v FIR")
+connNet_diffs %>% 
+  filter(method != "rest") %>% 
+  mutate(method = factor(method)) %$%
+  lsr::cohensD(diff ~ method,
+             method = "paired")
+
+print("Cohen's d for LPF v rest")
+connNet_diffs %>% 
+  filter(method != "resid") %>% 
+  mutate(method = factor(method)) %$%
+  lsr::cohensD(diff ~ method,
+             method = "paired")
+
+print("Cohen's d for FIR v rest")
+connNet_diffs %>% 
+  filter(method != "lpf") %>% 
+  mutate(method = factor(method)) %$%
+  lsr::cohensD(diff ~ method,
+             method = "paired")
+```
+
+**Figure 5A.** Bar graph showing the group-averaged within- and between-network connections Fisher z transformed connectivity for each method. The within- and between- network connectivity will be averaged across the 7 networks.
+
+```{r}
+# modify df for plotting
+# create columns for mean/sd
+connNet_mod <- connNet %>% 
+  group_by(method, nettype) %>% 
+  mutate(mean = mean(mconnz),
+         se = lurr::se(mconnz),
+         method = fct_relevel(method,
+                              c("lpf","rest","resid")),
+         nettype = factor(nettype, levels = c("within","between")))
+
+# create plot
+(fig_connNet <- connNet_mod %>% 
+  ggplot(aes(x = method, y = mconnz, color = nettype)) +
+  geom_bar(stat = "summary", fun = "mean", fill = "white",
+           position = position_dodge(width = .95)) +
+  geom_errorbar(aes(ymin = mean-se, ymax = mean+se),
+                stat = "identity", width = .2, 
+                position = position_dodge(width = .95)) +
+  geom_point(aes(y = mconnz, fill = nettype), 
+             stat = "identity", alpha = .3, size = 2, 
+             position = position_jitterdodge(jitter.width = .3, 
+                                             dodge.width = .95)) +
+  labs(x = "Connectivity Method", 
+       y = "Mean Connectivity\n(Fisher z)",
+       color = "Network", fill = "Network") +
+  #scale_color_manual(values = c("#CC79A7","#0072B2")) +
+  scale_color_manual(values = c("#3d5a80","#b56576")) +
+  scale_x_discrete(labels = c("LPF","Rest","FIR")) +
+  theme(text = element_text(size = 24),
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10))))
+
+(connNet_mod %>% 
+  ggplot(aes(x = nettype, y = mconnz, color = method)) +
+  geom_bar(stat = "summary", fun = "mean", fill = "white",
+           position = position_dodge(width = .95),
+           size = 1.01) +
+  geom_errorbar(aes(ymin = mean-se, ymax = mean+se),
+                stat = "identity", width = .2, size = .7,
+                position = position_dodge(width = .95)) +
+  geom_point(aes(y = mconnz, fill = method), 
+             stat = "identity", alpha = .3, size = 2, 
+             position = position_jitterdodge(jitter.width = .3, 
+                                             dodge.width = .95)) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  theme(text = element_text(size = 30),
+        axis.text = element_text(color = "black")))
+
+# ggsave("figures/connNet.pdf",
+#        fig_connNet, dpi = 300,
+#        width = 8, height = 5, units = "in")
+```
+
+**Figure 5B.** Bar plot showing the within - between differences in connectiviy for each method (i.e., plotting the interaction)
+
+```{r}
+connNet_mod2 <- connNet_mod %>% 
+  select(-mean,-se) %>% 
+  pivot_wider(names_from = nettype,
+              values_from = mconnz) %>% 
+  group_by(sbjs, method) %>% 
+  mutate(diff = within - between) %>% 
+  group_by(method) %>% 
+  mutate(mean = mean(diff),
+         se = lurr::se(diff),
+         method = fct_relevel(method,
+                              c("lpf","rest","resid")))
+
+colorlabs <- c("#1b9e77","#666666","#d95f02")
+
+(fig_connNetDiff <- connNet_mod2 %>% 
+  ggplot(aes(x = method, y = diff, color = method)) +
+  geom_bar(stat = "summary", fun = "mean", 
+           fill = "white", size = 1.01) +
+  geom_errorbar(aes(ymin = mean-se, ymax = mean+se),
+                stat = "identity", width = .2) +
+  geom_point(aes(fill = method), stat = "identity",
+             size = 2, alpha = .3,
+             position = position_jitter(width = .2)) +
+  #scale_color_brewer(type = "qual", palette = "Set1") +
+  scale_color_manual(values = colorlabs) +
+  labs(x = "Connectivity Method",
+       y = "Within - Between\nNetwork Connectivity") +
+  theme(legend.position = "none", 
+        text = element_text(size = 24),
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10))) +
+  scale_x_discrete(labels = c("LPF","Rest","FIR")))
+
+# ggsave("figures/connNetDiff.pdf",
+#        fig_connNetDiff, dpi = 300,
+#        width = 6, height = 5, units = "in")
+```
+
+To test whether differences between the connectivity methods differ by network, we will conduct an exploratory 3 (method) x 28 (7 within-network connectivity estimates, 21 between-network connectivity estimates) repeated measures ANOVA.
+
+```{r}
+# # Conduct Omnibus ANOVA for within-network connections
+# (comp_connNetAllWtn <- aov_ez(data = filter(connNetAll, nettype=="within"),
+#                            id = "sbjs",
+#                            dv = "mconnz",
+#                            within = c("method","netconn")))
+# 
+# summary(comp_connNetAllWtn)
+# 
+# # Estimated Marginal Means
+# ### Method x Network-Connection Interaction
+# (method_netconn_wtn.emm <- emmeans(comp_connNetAllWtn, c("method","netconn")))
+# # afex_plot(comp_connNetAllWtn, 
+# #           x = "netconn", trace = "method", 
+# #           mapping = "color", error = "within")
+# 
+# 
+# (fig_connNetAllWtn <- connNetAll_sum %>% 
+#   filter(nettype == "within") %>% 
+#   ggplot(aes(x = netconn, y = mean, fill = method)) +
+#   geom_bar(stat = "identity", color = "white",
+#            position = position_dodge(width = .9)) +
+#   geom_errorbar(aes(ymin = mean-se, ymax = mean+se),
+#                 width = .2,
+#                 position = position_dodge(width = .9)) +
+#   geom_point(data = filter(connNetAll, nettype=="within"),
+#              aes(x = netconn, y = mconnz),
+#              size = 1, alpha = .2,
+#              position = position_jitterdodge(dodge.width = .9,
+#                                              jitter.width = .2)) +
+#   scale_fill_brewer(type = "qual", palette = "Dark2") +
+#   theme(axis.text.y = element_text(color = "black", size = 16)))
+# 
+# ggsave("figures/connNetAllWtn.pdf",
+#        fig_connNetAllWtn, dpi = 300,
+#        width = 10, height = 4.5, units = "in")
+```
+
+```{r}
+# # Conduct Omnibus ANOVA for between-network connections
+# (comp_connNetAllBtw <- aov_ez(data = filter(connNetAll, nettype=="between"),
+#                            id = "sbjs",
+#                            dv = "mconnz",
+#                            within = c("method","netconn")))
+# 
+# summary(comp_connNetAllBtw)
+# 
+# # Estimated Marginal Means
+# ### Method x Network-Connection Interaction
+# (method_netconn_btw.emm <- emmeans(comp_connNetAllBtw, c("method","netconn")))
+# # afex_plot(comp_connNetAllWtn, 
+# #           x = "netconn", trace = "method", 
+# #           mapping = "color", error = "within")
+# 
+# (fig_connNetAllBtw <- connNetAll_sum %>% 
+#   filter(nettype == "between") %>% 
+#   ggplot(aes(x = netconn, y = mean, fill = method)) +
+#   geom_bar(stat = "identity", color = "white",
+#            position = position_dodge(width = .9)) +
+#   geom_errorbar(aes(ymin = mean-se, ymax = mean+se),
+#                 width = .2,
+#                 position = position_dodge(width = .9)) +
+#   geom_point(data = filter(connNetAll, nettype=="between"),
+#              aes(x = netconn, y = mconnz),
+#              size = .5, alpha = .1,
+#              position = position_jitterdodge(dodge.width = .9,
+#                                              jitter.width = .2)) +
+#   theme(axis.text = element_text(angle = 45)))
+# 
+# ggsave("figures/connNetAllBtw.pdf",
+#        fig_connNetAllBtw, dpi = 300,
+#        width = 10, height = 6, units = "in")
+```
+
+
+```{r}
+# Conduct Omnibus ANOVA for within-network connections
+(comp_connNetAll <- aov_ez(data = connNetAll,
+                           id = "sbjs",
+                           dv = "mconnz",
+                           within = c("method","netconn")))
+```
+Conduct paired samples t-test to compare each background connectivity network to the rest network
+
+```{r}
+connNetAll_wide <- connNetAll %>% 
+  pivot_wider(names_from = method,
+              values_from = mconnz)
+
+netconns <- unique(connNetAll_wide$netconn) 
+
+comp_MethodsxNetworks <- map_dfr(netconns, ~{
+  lpf_v_rest <- connNetAll_wide %>% 
+    filter(netconn == .x) %$% 
+    t.test(lpf, rest) %>% 
+    broom::tidy() %>% 
+    mutate(netconn = .x,
+           comparison = "lpf_rest") %>% 
+    select(comparison, netconn, everything())
+  
+  resid_v_rest <- connNetAll_wide %>% 
+    filter(netconn == .x) %$% 
+    t.test(resid, rest) %>% 
+    broom::tidy() %>% 
+    mutate(netconn = .x,
+           comparison = "resid_rest") %>% 
+    select(comparison, netconn, everything())
+  
+  lpf_v_resid <- connNetAll_wide %>% 
+    filter(netconn == .x) %$% 
+    t.test(lpf, resid) %>% 
+    broom::tidy() %>% 
+    mutate(netconn = .x,
+           comparison = "lpf_resid") %>% 
+    select(comparison, netconn, everything())
+  
+  rbind(lpf_v_rest,
+        resid_v_rest,
+        lpf_v_resid)
+    
+}) %>% 
+  separate(netconn, c("net1","net2")) %>% 
+  mutate(across(where(is.numeric), round, digits = 3),
+         nettype = ifelse(net1==net2,"within","between")) %>%
+  ungroup() %>% 
+  arrange(desc(statistic)) %>% 
+  arrange(comparison) %>% 
+  print()
+  
+  
+```
+
+## Analysis 3
+
+#### How do individual differences in connectivity compare between the three methods?
+
+For each connection, we will calculate the across subject correlations in connectivity estimates obtained by each of three methods. For example, for l_vis1xl_vis2, would would correlate the subject estimates from the resting state scan with subject estimates from the lpf scans.
+
+Using the fisher z transformed correlations
+
+```{r}
+corrIDs <- df_meltz %>% 
+  ungroup() %>%
+  unite(col = "connection", c("roi1","roi2"), sep = "-") %>% 
+  unite(col = "netconn", c("net1","net2")) %>% 
+  pivot_wider(names_from = method,
+              values_from = connz) %>% 
+  group_by(connection, netconn, nettype) %>% 
+  summarize(rest_lpf = cor(rest, lpf, method = "spearman"),
+            #rest_lpf_n = n(),
+            rest_resid = cor(rest, resid, method = "spearman"),
+            #rest_resid_n = n(),
+            lpf_resid = cor(lpf, resid, method = "spearman"),
+            #lpf_resid_n = n(),
+            .groups = "keep") %>% 
+  separate(col = connection, into = c("roi1","roi2"), sep = "-") %>% 
+  separate(col = netconn, into = c("net1","net2"))
+
+corrIDs_long <- corrIDs %>% 
+  pivot_longer(cols = c(6:8),
+               names_to = "comparison",
+               values_to = "rho")
+```
+
+Visualize the across-subject correlations for each connection
+
+```{r}
+comparison <- c("rest_lpf","rest_resid","lpf_resid")
+walk(comparison, ~{
+  
+  # filter out correlations for the comparison
+  tmp_lower <- corrIDs_long %>% 
+    ungroup() %>% 
+    filter(comparison == .x)
+  
+  # duplicate values for the upper triangle
+  tmp_upper <- tmp_lower %>% 
+    rename(roi1 = roi2,
+           roi2 = roi1)
+  
+  # combine upper/lower triangles into single df
+  tmp <- rbind(tmp_lower, tmp_upper) %>% 
+    select(roi1, roi2, rho) %>% 
+    mutate(roi1 = fct_relevel(roi1, rois$roi),
+           roi2 = fct_relevel(roi2, rois$roi)) %>% 
+    arrange(roi1)
+  
+  # cast df into a 100x100 matrix
+  tmp_mat <- acast(data = tmp,
+               roi1~roi2,
+               value.var = "rho")
+  
+  # plot matrix
+  tmp_fig <- ggcorrplot(tmp_mat,
+                        method = "square",
+                        outline.color = FALSE,
+                        lab = FALSE,
+                        tl.cex = 5,
+                        title = .x)
+  
+  # ggsave(str_c("figures/corrIDs_", .x, ".pdf"),
+  #        tmp_fig, dpi = 300,
+  #        width = 8, height = 8)
+})
+
+```
+
+Summarize the across-subject correlations for each connection (RAW CORRELATIONS)
+
+```{r}
+corrIDs_sum <- corrIDs %>% 
+  ungroup() %>% 
+  select(6:8) %>%  
+  psych::describe() %>% 
+  print()
+```
+
+**Figure 6A. OPTION 1** Create density plot showing distribution of the individual differences correlations across all of the 100x100 [unique, obviously] connections
+Plotting the raw correlations between the methods
+
+```{r}
+colorlabs <- c("#1b9e77","#d95f02","#666666")
+
+(fig_corrIDs_allcon_densityplot <- corrIDs_long %>% 
+  mutate(comparison = fct_relevel(comparison,
+                                  "rest_lpf",
+                                  "rest_resid",
+                                  "lpf_resid")) %>% 
+  ggplot(aes(x = rho, y = comparison, fill = comparison)) +
+  geom_density_ridges(alpha = .6, scale = 5,
+                      quantile_lines = TRUE, quantiles = 2) +
+  scale_fill_manual(values = colorlabs) +
+  theme(legend.position = "none",
+        text = element_text(size = 30),
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10))) + 
+  scale_y_discrete(labels = c("RestxLPF","RestxFIR","LPFxFIR")) +
+  labs(x = "Spearman's rho", y = "Comparison") )
+
+ggsave(filename = "figures/corrIDs_allcons_density.pdf",
+       plot = fig_corrIDs_allcon_densityplot, dpi = 300,
+       width = 7, height = 6)   
+```
+
+**Figure 6A. OPTION 2** Create boxplot showing distribution of the individual differences correlations across all of the 100x100 [unique, obviously] connections
+Plotting the raw correlations between the methods
+
+```{r}
+colorlabs <- c("#1b9e77","#d95f02","#666666")
+
+(fig_corrIDs_allcons_boxplot <- corrIDs_long %>% 
+  mutate(comparison = fct_relevel(comparison,
+                                  "rest_lpf",
+                                  "rest_resid",
+                                  "lpf_resid")) %>% 
+  ggplot(aes(x = comparison, y = rho, color = comparison)) +
+  geom_boxplot(size = 1.1) + 
+  scale_color_manual(values = colorlabs) +
+  scale_fill_manual(values = colorlabs) +
+  theme(legend.position = "none",
+        text = element_text(size = 30),
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10))) + 
+  labs(x = "Comparison", y = "Reliability (rho)") +
+  scale_x_discrete(labels = c("RestxLPF","RestxFIR","LPFxFIR")))
+
+ggsave(filename = "figures/corrIDs_allcons_boxplot.pdf",
+       plot = fig_corrIDs_allcons_boxplot, dpi = 300,
+       width = 7, height = 6)  
+```
+
+**Figure 6B.** Plot and calculate the correlation between methods to see if those connections that were most similar between rest and resid were also most similar between rest and lpf.
+Plotting the raw correlations between the methods, but calculating the correlation test with the z-transformed correlatios
+
+```{r}
+# need to convert to Fisher z
+corrIDs <- corrIDs %>% 
+  mutate(rest_lpfz = fisherz(rest_lpf),
+         rest_residz = fisherz(rest_resid))
+
+cor.test(corrIDs$rest_lpfz, corrIDs$rest_residz)
+
+fig_compCorrIDs <- corrIDs %>% 
+  ggplot(aes(x = rest_lpf, y = rest_resid)) +
+  geom_point(stat = "identity", alpha = .3, 
+             color = "gray35") +
+  # geom_smooth(method = "lm", color = "black") +
+  theme(text = element_text(size = 30),
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10))) +
+  # xlim(c(.3,1)) +
+  # ylim(c(.3,1)) +
+  labs(x = "Rest x LPF Reliability (rho)",
+       y = "Rest x FIR Reliability (rho)") +
+    geom_abline(slope = 1, color = "black", 
+                linetype = "dashed", size = 1)
+
+(fig_compCorrIDs <- ggMarginal(fig_compCorrIDs, data = corrIDs, type = "density", 
+                             xparams = list(fill = "#1B9E77", alpha = .75),
+                             yparams = list(fill = "#D95F02", alpha = .75)))
+
+ggsave("figures/corrIDs_allcon_scatter.pdf",
+       fig_compCorrIDs, dpi = 300,
+       width = 7, height = 6)
+```
+
+
+Plot the correlations for a few of the connections to see if there are any outliers
+- NOPE
+
+```{r, fig.height=2.5, fig.width=2.5}
+# samp_conn <- corrIDs_long %>% 
+#   unite(col = "connection", c(roi1, roi2)) %>% 
+#   pull(connection) %>% 
+#   unique() %>% 
+#   sample(size = 3, replace = FALSE)
+# 
+# corrID_examples_restVlpf <- df_meltz %>% 
+#   ungroup() %>% 
+#   unite(col = "connection", c(roi1, roi2)) %>% 
+#   filter(connection %in% samp_conn) %>% 
+#   pivot_wider(names_from = method, 
+#               values_from = connz) %>% 
+#   ggplot(aes(x = lpf, y = rest)) +
+#   geom_point(size = .5) +
+#   geom_smooth(method = "lm", size = .5) + 
+#   facet_wrap(~connection, nrow = 1) +
+#   theme_minimal(base_size = 8)
+# 
+# corrID_examples_restVresid <- df_meltz %>% 
+#   ungroup() %>% 
+#   unite(col = "connection", c(roi1, roi2)) %>% 
+#   filter(connection %in% samp_conn) %>% 
+#   pivot_wider(names_from = method, 
+#               values_from = connz) %>% 
+#   ggplot(aes(x = resid, y = rest)) +
+#   geom_point(size = .5) +
+#   geom_smooth(method = "lm", size = .5) + 
+#   facet_wrap(~connection, nrow = 1) +
+#   theme_minimal(base_size = 8)
+# 
+# corrID_examples_residVlpf <- df_meltz %>% 
+#   ungroup() %>% 
+#   unite(col = "connection", c(roi1, roi2)) %>% 
+#   filter(connection %in% samp_conn) %>% 
+#   pivot_wider(names_from = method, 
+#               values_from = connz) %>% 
+#   ggplot(aes(x = lpf, y = resid)) +
+#   geom_point(size = .5) +
+#   geom_smooth(method = "lm", size = .5) + 
+#   facet_wrap(~connection, nrow = 1) +
+#   theme_minimal(base_size = 8)
+# 
+# gridExtra::grid.arrange(corrID_examples_restVlpf,
+#                         corrID_examples_restVresid,
+#                         corrID_examples_residVlpf)
+```
+
+Calculate the across-subject correlations for each network
+
+```{r}
+# This correlates the single connections and then averages within network-network connections
+# corrIDs_long_bynet <- corrIDs_long %>% 
+#   unite(col = "netconn", c(net1, net2)) %>% 
+#   group_by(netconn, nettype, comparison) %>% 
+#   summarize(mrho = mean(rho),
+#             .groups = "keep") %>% 
+#   separate(col = netconn, c("net1","net2"))
+
+# This will average connections within network-network connections and then correlate b/w methods
+corrIDs_bynet <- connNetAll %>% 
+  pivot_wider(names_from = method,
+              values_from = mconnz) %>% 
+  group_by(netconn, nettype) %>% 
+  summarize(rest_lpf = cor(rest, lpf, method = "spearman"),
+            #rest_lpf_n = n(),
+            rest_resid = cor(rest, resid, method = "spearman"),
+            #rest_resid_n = n(),
+            lpf_resid = cor(lpf, resid, method = "spearman"),
+            #lpf_resid_n = n(),
+            .groups = "keep")
+
+corrIDs_bynet_long <- corrIDs_bynet %>% 
+  ungroup() %>% 
+  separate(col = netconn,
+           into = c("net1","net2")) %>% 
+  pivot_longer(cols = c(4:6),
+               names_to = "comparison",
+               values_to = "rho")
+```
+
+
+Summarize the across-subject correlations for each network-network connection (using the RAW correlations)
+
+```{r}
+corrIDs_bynet %>% 
+  ungroup() %>% 
+  select(rest_lpf, rest_resid, lpf_resid) %>% 
+  psych::describe()
+
+```
+
+Compare the reliability of individual differences between RestxLPF and RestxResid
+Using the z-transformed correlations!
+
+```{r}
+corrIDs_bynet <- corrIDs_bynet %>% 
+  mutate(rest_lpfz = fisherz(rest_lpf),
+         rest_residz = fisherz(rest_resid))
+
+broom::tidy(t.test(x = corrIDs_bynet$rest_lpfz,
+                   y = corrIDs_bynet$rest_residz,
+                   paired = TRUE)) %>% 
+  mutate(across(where(is.numeric), round, digits = 3))
+
+t.test(x = corrIDs_bynet$rest_lpfz,
+                   y = corrIDs_bynet$rest_residz,
+                   paired = TRUE)
+
+corrIDs_bynet %>% 
+  ungroup() %>% 
+  select(netconn, rest_lpfz, rest_residz) %>% 
+  pivot_longer(cols = c(2:3),
+             names_to = "comparison",
+             values_to = "rz") %$%
+  lsr::cohensD(rz ~ comparison, method = "paired")
+  
+```
+
+Plot the correlations for all network-network connections
+
+```{r}
+df_meltz_wide <- df_meltz %>% 
+  ungroup() %>%
+  unite(col = "netconn",
+        c(net1, net2)) %>%
+  group_by(sbjs, method, netconn) %>%
+  summarize(mconnz = mean(connz),
+            .groups = "keep") %>% 
+  pivot_wider(names_from = method,
+              values_from = mconnz)
+
+# REST x LPF
+corrID_restxlpf_corrplots <- df_meltz_wide %>% 
+  ggplot(aes(x = rest, y = lpf)) +
+  geom_point(size = .75, alpha = .5) +
+  geom_smooth(method = "lm", size = .75) +
+  facet_wrap(~netconn, nrow = 4, scales = "free") 
+
+ggsave(filename = "figures/corrIDs_bynet_corrplots_restxlpf.pdf",
+       plot = corrID_restxlpf_corrplots,
+       width = 15, height = 9)
+
+# REST x RESID
+corrID_restxresid_corrplots <- df_meltz_wide %>% 
+  ggplot(aes(x = rest, y = resid)) +
+  geom_point(size = .75, alpha = .5) +
+  geom_smooth(method = "lm", size = .75) +
+  facet_wrap(~netconn, nrow = 4, scales = "free") 
+
+# ggsave(filename = "figures/corrIDs_bynet_corrplots_restxresid.pdf",
+#        plot = corrID_restxresid_corrplots,
+#        width = 15, height = 9)
+
+# LPF x RESID
+corrID_lpfxresid_corrplots <- df_meltz_wide %>% 
+  ggplot(aes(x = lpf, y = resid)) +
+  geom_point(size = .75, alpha = .5) +
+  geom_smooth(method = "lm", size = .75) +
+  facet_wrap(~netconn, nrow = 4, scales = "free") 
+
+# ggsave(filename = "figures/corrIDs_bynet_corrplots_lpfxresid.pdf",
+#        plot = corrID_lpfxresid_corrplots,
+#        width = 15, height = 9)
+
+```
+
+Plot the correlations for highest and lowest correlations for each comparison
+
+```{r}
+# 
+# ## REST x LPF ##
+# # Find the largest and smallest correlation
+# max_netconn <- corrIDs_bynet %>% 
+#   ungroup() %>% 
+#   slice_max(order_by = rest_lpf) %>% 
+#   pull(netconn)
+# 
+# min_netconn <- corrIDs_bynet %>% 
+#   ungroup() %>% 
+#   slice_min(order_by = rest_lpf) %>% 
+#   pull(netconn)
+# 
+# max_plot <- df_meltz_wide %>% 
+#   filter(netconn == max_netconn) %>% 
+#   ggplot(aes(x = rest, y = lpf)) +
+#   geom_point(alpha = .3, size = 5) +
+#   geom_smooth(method = "lm", color = "black", size = 3) +
+#   labs(x = "Rest", y = "Low-pass filter",
+#        title = "Default-Limbic") + 
+#   theme_minimal(base_size = 40) +
+#   theme(axis.text = element_text(color = "black"),
+#         plot.title = element_text(hjust = .5))
+# 
+# ggsave(filename = "figures/corrID_bynet_maxplot_restxlpf.pdf",
+#        plot = max_plot, width = 8, height = 8, dpi = 300)
+# 
+# min_plot <- df_meltz_wide %>% 
+#   filter(netconn == min_netconn) %>% 
+#   ggplot(aes(x = rest, y = lpf)) +
+#   geom_point(alpha = .3, size = 5) +
+#   geom_smooth(method = "lm", color = "black", size = 3) +
+#   labs(x = "Rest", y = "Low-pass filter",
+#        title = "Default-Visual") + 
+#   theme_minimal(base_size = 40) +
+#   theme(axis.text = element_text(color = "black"),
+#         plot.title = element_text(hjust = .5))
+# 
+# ggsave(filename = "figures/corrID_bynet_minplot_restxlpf.pdf",
+#        plot = min_plot, width = 8, height = 8, dpi = 300)
+# 
+# ## REST x RESID ##
+# # Find the largest and smallest correlation
+# max_netconn <- corrIDs_bynet %>% 
+#   ungroup() %>% 
+#   slice_max(order_by = rest_resid) %>% 
+#   pull(netconn)
+# 
+# min_netconn <- corrIDs_bynet %>% 
+#   ungroup() %>% 
+#   slice_min(order_by = rest_resid) %>% 
+#   pull(netconn)
+# 
+# max_plot <- df_meltz_wide %>% 
+#   filter(netconn == max_netconn) %>% 
+#   ggplot(aes(x = rest, y = resid)) +
+#   geom_point(alpha = .3, size = 5) +
+#   geom_smooth(method = "lm", color = "black", size = 3) +
+#   labs(x = "Rest", y = "Residual",
+#        title = "Default-Limbic") + 
+#   theme_minimal(base_size = 40) +
+#   theme(axis.text = element_text(color = "black"),
+#         plot.title = element_text(hjust = .5))
+# 
+# ggsave(filename = "figures/corrID_bynet_maxplot_restxresid.pdf",
+#        plot = max_plot, width = 8, height = 8, dpi = 300)
+# 
+# min_plot <- df_meltz_wide %>% 
+#   filter(netconn == min_netconn) %>% 
+#   ggplot(aes(x = rest, y = resid)) +
+#   geom_point(alpha = .3, size = 5) +
+#   geom_smooth(method = "lm", color = "black", size = 3) +
+#   labs(x = "Rest", y = "Residual",
+#        title = "Dorsal Attn-Visual") + 
+#   theme_minimal(base_size = 40) +
+#   theme(axis.text = element_text(color = "black"),
+#         plot.title = element_text(hjust = .5))
+# 
+# ggsave(filename = "figures/corrID_bynet_minplot_restxresid.pdf",
+#        plot = min_plot, width = 8, height = 8, dpi = 300)
+```
+
+Plot the across-subject correlations for each network-network connection
+
+```{r}
+comparison <- c("rest_lpf","rest_resid","lpf_resid")
+
+network_order <- c("default","cont","limbic","salventattn",
+                   "dorsattn","sommot","vis")
+
+walk(comparison, ~ {
+  
+  # filter out correlations for the comparison
+  tmp_lower <- corrIDs_bynet_long %>% 
+    ungroup() %>% 
+    filter(comparison == .x)
+  
+  # duplicate values for the upper triangle
+  tmp_upper <- tmp_lower %>% 
+    filter(nettype == "between") %>% 
+    rename(net1 = net2,
+           net2 = net1)
+
+  # combine upper/lower triangles into single df
+  tmp <- rbind(tmp_lower, tmp_upper) %>% 
+    select(net1, net2, rho) %>% 
+    mutate(net1 = fct_relevel(net1, rev(network_order)),
+           net2 = fct_relevel(net2, rev(network_order))) %>% 
+    arrange(net1)
+  
+  # cast df into a 100x100 matrix
+  tmp_mat <- acast(data = tmp,
+                   net1~net2,
+                   value.var = "rho")
+  
+  # plot matrix
+  tmp_fig <- ggcorrplot(tmp_mat,
+                        method = "square",
+                        outline.color = FALSE,
+                        lab = TRUE,
+                        legend.title = "Rho",
+                        title = .x) +
+    scale_fill_gradient(limit = c(0, 1),
+                        low = "white", high = "red",
+                        name = "Rho")
+  
+
+  # ggsave(str_c("figures/corrIDs_byNet_fix_", .x, ".pdf"),
+  #        tmp_fig, dpi = 300,
+  #        width = 7, height = 6, units = "in")
+})
+```
+
+## Bonus Analyses 
+
+Individual differences using the background connectivity methods are not as correlated with those found in the resting state data. To get a picture of what's going on we want to know if individual differences in background connectivity during the task are tracking behavior.
+
+```{r}
+corrBehav <- df_meltz %>% 
+  ungroup() %>% 
+  unite(col = "netconn",
+        c(net1, net2)) %>% 
+  group_by(sbjs, method, netconn) %>% 
+  summarize(mconnz = mean(connz),
+            .groups = "keep") %>%
+  ungroup() %>% 
+  left_join(behav, by = c("sbjs" = "ssid")) %>% 
+  group_by(method, netconn) %>% 
+  summarize(corr_cat_old = cor(mconnz, facat_acc_cat_old, 
+                               method = "spearman", use = "pairwise.complete.obs"),
+            corr_cat_new = cor(mconnz, facat_acc_cat_new, 
+                               method = "spearman", use = "pairwise.complete.obs"),
+            corr_recog_chr = cor(mconnz, facat_acc_recog_chr, 
+                                 method = "spearman", use = "pairwise.complete.obs"),
+            .groups = "keep")
+
+
+
+
+# Plot distribution of correlations
+corrBehav %>% 
+  ggplot(aes(x = method, y = corr_cat_old, fill = method)) +
+  geom_boxplot() +
+  theme(legend.position = "none")
+
+corrBehav %>% 
+  ggplot(aes(x = method, y = corr_cat_new, fill = method)) +
+  geom_boxplot() +
+  theme(legend.position = "none")
+
+corrBehav %>% 
+  ggplot(aes(x = method, y = corr_recog_chr, fill = method)) +
+  geom_boxplot() +
+  theme(legend.position = "none")
+
+```
+
+For each method, plot the correlation between each of the 28 network-network connections and behavior
+
+```{r}
+avgNetconn <- df_meltz %>% 
+    ungroup() %>% 
+    unite(col = "netconn",
+          c(net1, net2)) %>% 
+    group_by(sbjs, method, netconn) %>% 
+    summarize(mconnz = mean(connz),
+              .groups = "keep")
+
+avgNetconnBehav <- left_join(avgNetconn, behav, by = c("sbjs" = "ssid")) %>% 
+  left_join(corrBehav) %>% 
+  mutate(across(contains("corr"), round, digits = 2)) %>% 
+  mutate(netconn_catold = str_c(netconn, ", r = ", corr_cat_old),
+         netconn_catnew = str_c(netconn, ", r = ", corr_cat_new),
+         netconn_recog = str_c(netconn, ", r = ", corr_recog_chr))
+
+walk(method, ~{
+  # # Troubleshoot
+  # .x <- methods[1]
+  
+  p1 <- avgNetconnBehav %>% 
+    filter(method == .x) %>% 
+    ggplot(aes(x = mconnz, y = facat_acc_cat_old)) +
+    geom_point(size = .75, alpha = .5) +
+    geom_smooth(method = "lm", size = .75) +
+    facet_wrap(~netconn_catold, nrow = 4, scales = "free") +
+    theme_minimal(base_size = 10)
+  
+  ggsave(plot = p1,
+         filename = str_c("figures/corr_behav_", .x, "_catOld.pdf"),
+         height = 9, width = 15)
+  
+  p2 <- avgNetconnBehav %>% 
+    filter(method == .x) %>% 
+    ggplot(aes(x = mconnz, y = facat_acc_cat_new)) +
+    geom_point(size = .75, alpha = .5) +
+    geom_smooth(method = "lm", size = .75) +
+    facet_wrap(~netconn_catnew, nrow = 4, scales = "free") +
+    theme_minimal(base_size = 10)
+  
+  ggsave(plot = p2,
+         filename = str_c("figures/corr_behav_", .x, "_catNew.pdf"),
+         height = 9, width = 15)
+  
+  p3 <- avgNetconnBehav %>% 
+    filter(method == .x) %>% 
+    ggplot(aes(x = mconnz, y = facat_acc_recog_chr)) +
+    geom_point(size = .75, alpha = .5) +
+    geom_smooth(method = "lm", size = .75) +
+    facet_wrap(~netconn_recog, nrow = 4, scales = "free") +
+    theme_minimal(base_size = 10)
+  
+  ggsave(plot = p3,
+         filename = str_c("figures/corr_behav_", .x, "_recogCHR.pdf"),
+         height = 9, width = 15)
+    
+})
+```
+
+How does each person's pattern of connectivity predict behavior?
+
+```{r}
+corrBehav_rest <- avgNetconn %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = netconn,
+              values_from = mconnz) %>% 
+  filter(method == "rest") %>% 
+  left_join(behav, by = c("sbjs" = "ssid")) %>% 
+  select(-sbjs, -method) %>% 
+  cor(use = "pairwise.complete")
+
+ggcorrplot(corrBehav_rest,
+          method = "square",
+          outline.color = FALSE,
+          lab = TRUE,
+          title = "Rest",
+          lab_size = 2)
+
+corrBehav_resid <- avgNetconn %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = netconn,
+              values_from = mconnz) %>% 
+  filter(method == "resid") %>% 
+  left_join(behav, by = c("sbjs" = "ssid")) %>% 
+  select(-sbjs, -method) %>% 
+  cor(use = "pairwise.complete")
+
+ggcorrplot(corrBehav_resid,
+          method = "square",
+          outline.color = FALSE,
+          lab = TRUE,
+          title = "Residual",
+          lab_size = 2)
+
+corrBehav_lpf <- avgNetconn %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = netconn,
+              values_from = mconnz) %>% 
+  filter(method == "lpf") %>% 
+  left_join(behav, by = c("sbjs" = "ssid")) %>% 
+  select(-sbjs, -method) %>% 
+  cor(use = "pairwise.complete")
+
+ggcorrplot(corrBehav_lpf,
+          method = "square",
+          outline.color = FALSE,
+          lab = TRUE,
+          title = "Low-pass Filter",
+          lab_size = 2)
+```
+
+Since some predictors are highly correlated, going to use PCA to reduce the number of predictors
+
+```{r}
+## PCA FOR REST CONNECTIVITY ##
+# get rest connections
+restConn <- avgNetconn %>% 
+  pivot_wider(names_from = netconn,
+              values_from = mconnz) %>% 
+  filter(method == "rest")
+
+# scale connectivity 
+restConn <- scale(restConn[,-1:-2])
+
+# run pca
+# 7 eigenvalues greater than 1
+(pca_rest <- principal(restConn, nfactors = 8,
+                      rotate = "oblimin", use = "pairwise",
+                      scores = TRUE))
+
+# plot(pca_rest$values)
+# sum(pca_rest$values > 1)
+
+print.psych(pca_rest, digits = 2, cut = .3, sort = TRUE) # run in console for better view
+
+mean(pca_rest$communality) # want this above .7
+
+# get scores
+comps_rest <- data.frame(pca_rest$scores) %>% 
+  mutate(ssid = unique(avgNetconnBehav$sbjs)) %>% 
+  left_join(behav) %>% 
+  select(-ssid) %>% 
+  rename(dorsattn_default = TC4,
+         vis_limdef = TC7,
+         sommot_other = TC3,
+         vis_ssc = TC5,
+         ventattn_other = TC6,
+         limbic_wtn_other = TC1,
+         control_other = TC2,
+         control_within = TC8)
+```
+
+```{r}
+## PCA FOR RESID CONNECTIVITY ##
+# get connections
+residConn <- avgNetconn %>% 
+  pivot_wider(names_from = netconn,
+              values_from = mconnz) %>% 
+  filter(method == "resid")
+
+# scale connectivity 
+residConn <- scale(residConn[,-1:-2])
+
+# run pca
+# 7 eigenvalues greater than 1
+(pca_resid <- principal(residConn, nfactors = 8,
+                      rotate = "oblimin", use = "pairwise",
+                      scores = TRUE))
+
+# plot(pca_resid$values)
+# sum(pca_resid$values > 1)
+
+print.psych(pca_resid, digits = 2, cut = .3, sort = TRUE) # run in console for better view
+
+mean(pca_resid$communality) # want this above .7
+
+# get scores
+comps_resid <- data.frame(pca_resid$scores) %>% 
+  mutate(ssid = unique(avgNetconnBehav$sbjs)) %>% 
+  left_join(behav) %>% 
+  select(-ssid) %>% 
+  rename(attn = TC1,
+         vis_ldd_wtn = TC2,
+         limbic_other_wtn = TC8,
+         sommot_other = TC3,
+         sommot_wtn_control = TC6,
+         cont_other = TC5,
+         vis_ss_wtn = TC4,
+         contwtn_contvis_dorswtn = TC7)
+```
+
+```{r}
+## PCA FOR LPF CONNECTIVITY ##
+# get connections
+lpfConn <- avgNetconn %>% 
+  pivot_wider(names_from = netconn,
+              values_from = mconnz) %>% 
+  filter(method == "lpf")
+
+# scale connectivity 
+lpfConn <- scale(lpfConn[,-1:-2])
+
+# run pca
+# 7 eigenvalues greater than 1
+(pca_lpf <- principal(lpfConn, nfactors = 9,
+                      rotate = "oblimin", use = "pairwise",
+                      scores = TRUE))
+
+# plot(pca_lpf$values)
+# sum(pca_lpf$values > 1)
+
+print.psych(pca_lpf, digits = 2, cut = .3, sort = TRUE) # run in console for better view
+
+mean(pca_lpf$communality) # want this above .7
+
+# get scores
+comps_lpf <- data.frame(pca_lpf$scores) %>% 
+  mutate(ssid = unique(avgNetconnBehav$sbjs)) %>% 
+  left_join(behav) %>% 
+  select(-ssid) %>% 
+  rename(vis_wtn_ldd = TC2,
+         sommot_ldd= TC3,
+         attn = TC1,
+         control_other = TC8,
+         limbic_wtn_other = TC6,
+         vis_ss_wtn = TC4,
+         contol_wtn_other = TC5,
+         limbic_default_dors = TC9,
+         sommot_wtn_other = TC7)
+```
+
+How do the network components correlate with behavior for each method?
+
+```{r}
+## CORRELATIONS WITH CAT OLD ##
+mdl <- lm(facat_acc_cat_old ~ ., data = comps_rest[,1:9])
+summary(mdl)
+
+cor(comps_rest, use = "pairwise.complete.obs")
+
+mdl <- lm(facat_acc_cat_old ~ ., data = comps_resid[,1:9])
+summary(mdl)
+
+cor(comps_resid, use = "pairwise.complete.obs")
+
+
+mdl <- lm(facat_acc_cat_old ~ ., data = comps_lpf[,1:10])
+summary(mdl)
+
+cor(comps_lpf, use = "pairwise.complete.obs")
+
+```
+
+```{r}
+comps_lpf %>% 
+  ggplot(aes(x = limbic_wtn_other,
+             y = facat_acc_cat_old)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+```
+
+
+
+```{r}
+## CORRELATIONS WITH CAT NEW ##
+mdl <- lm(facat_acc_cat_new ~ ., data = comps_rest[,c(1:8,10)])
+summary(mdl)
+
+mdl <- lm(facat_acc_cat_new ~ ., data = comps_resid[,c(1:8,10)])
+summary(mdl)
+
+mdl <- lm(facat_acc_cat_new ~ ., data = comps_lpf[,c(1:9,11)])
+summary(mdl)
+```
+
+
+```{r}
+## CORRELATIONS WITH RECOG CHR ##
+mdl <- lm(facat_acc_recog_chr ~ ., data = comps_rest[,c(1:8,11)])
+summary(mdl)
+
+mdl <- lm(facat_acc_recog_chr ~ ., data = comps_resid[,c(1:8,11)])
+summary(mdl)
+
+mdl <- lm(facat_acc_recog_chr ~ ., data = comps_lpf[,c(1:9,12)])
+summary(mdl)
+```
